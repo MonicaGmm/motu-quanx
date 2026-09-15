@@ -474,6 +474,7 @@ function pkcs1Unpad(m) {
   var i = 2;
   while (i < m.length && m[i] !== 0) i++;
   if (i >= m.length - 1) return null;
+  if (i - 2 < 8) return null;            // PKCS#1 要求 PS 至少 8 字节（也顺带压掉误判）
   return m.slice(i + 1);
 }
 function pkcs1Pad(msg, k) {
@@ -581,7 +582,7 @@ function keyCandidates(m) {
 
 // 待签字段的排列组合（用抓包里的真实数据反推服务端/客户端签名算法）
 function signCandidatesFor(f) {
-  var fields = ['data', 'iv', 'nonce', 'timestamp', 'keyId', 'plain'];
+  var fields = ['data', 'iv', 'nonce', 'timestamp', 'keyId', 'encryptedKey', 'plain'];
   var seps = ['', '|', '&', ',', ':'];
   var perm2 = [];                       // 单字段 + 双字段
   var i, j, k, si;
@@ -589,7 +590,9 @@ function signCandidatesFor(f) {
   for (i = 0; i < fields.length; i++) for (j = 0; j < fields.length; j++) if (i !== j) perm2.push([fields[i], fields[j]]);
   // 三元/四元只取常见顺序，控制规模
   var three = [['data', 'iv', 'nonce'], ['data', 'nonce', 'iv'], ['iv', 'nonce', 'data'], ['data', 'iv', 'timestamp'], ['data', 'timestamp', 'nonce'],
-    ['timestamp', 'nonce', 'data'], ['nonce', 'timestamp', 'data'], ['iv', 'data', 'nonce'], ['data', 'nonce', 'timestamp'], ['data', 'iv', 'nonce', 'timestamp'], ['data', 'iv', 'nonce', 'timestamp', 'keyId'], ['timestamp', 'nonce', 'iv', 'data']];
+    ['timestamp', 'nonce', 'data'], ['nonce', 'timestamp', 'data'], ['iv', 'data', 'nonce'], ['data', 'nonce', 'timestamp'], ['data', 'iv', 'nonce', 'timestamp'], ['data', 'iv', 'nonce', 'timestamp', 'keyId'], ['timestamp', 'nonce', 'iv', 'data'],
+    ['data', 'iv', 'nonce', 'timestamp', 'encryptedKey'], ['encryptedKey', 'data', 'iv', 'nonce', 'timestamp'], ['data', 'iv', 'nonce', 'timestamp', 'keyId', 'encryptedKey'],
+    ['encryptedKey', 'nonce'], ['encryptedKey', 'timestamp'], ['data', 'encryptedKey', 'nonce'], ['iv', 'encryptedKey', 'nonce'], ['nonce', 'keyId', 'data']];
   var orders = perm2.concat(three);
   var out = [];
   for (si = 0; si < seps.length; si++) {
@@ -665,8 +668,49 @@ function aadCandidates(env) {
   if (env.timestamp !== undefined && env.timestamp !== null) out.push({ tag: 'ts', aad: strToBytes(String(env.timestamp)) });
   if (env.keyId) out.push({ tag: 'keyId', aad: strToBytes(String(env.keyId)) });
   if (env.nonce && env.timestamp !== undefined) out.push({ tag: 'nonce+ts', aad: strToBytes(env.nonce + String(env.timestamp)) });
+  if (env.timestamp !== undefined && env.nonce) out.push({ tag: 'ts+nonce', aad: strToBytes(String(env.timestamp) + env.nonce) });
   if (env.ivB64) out.push({ tag: 'ivB64', aad: strToBytes(env.ivB64) });
+  if (env.keyId && env.nonce) out.push({ tag: 'keyId+nonce', aad: strToBytes(String(env.keyId) + env.nonce) });
+  if (env.saltB64) out.push({ tag: 'saltB64', aad: strToBytes(env.saltB64) });
+  if (env.saltB64) out.push({ tag: 'saltRaw', aad: b64Decode(env.saltB64) });
+  out.push({ tag: 'motu', aad: strToBytes('motu') });
   return out;
+}
+
+/* 把原 body 按「字节数完全对齐」的方式重建。
+   JSON 里 / 与 \/ 完全等价，每把一个 / 写成 \/ 就多 1 字节，于是可以在
+   [无转义长度, 全转义长度] 区间内精确命中原 body 的字节数。
+   这样即使宿主没有按我们给的 Content-Length 重算，服务端读到的长度也是对的。 */
+function buildRequestBody(orig, obj) {
+  var plain = JSON.stringify(obj);
+  var full = plain.replace(/\//g, '\\/');
+  var total = (plain.match(/\//g) || []).length;
+  var target = orig ? byteLen(orig) : byteLen(full);
+  var need = target - byteLen(plain);
+  if (need < 0) need = 0;
+  if (need > total) need = total;
+  if (need === 0) return plain;
+  if (need === total) return full;
+  var n = 0;
+  return plain.replace(/\//g, function () { n++; return n <= need ? '\\/' : '/'; });
+}
+function byteLen(s) { return strToBytes(s).length; }
+function mergeHeaders(h, add) {
+  var out = {}, k, e;
+  for (k in (h || {})) if (Object.prototype.hasOwnProperty.call(h, k)) out[k] = h[k];
+  for (k in add) if (Object.prototype.hasOwnProperty.call(add, k)) {
+    for (e in out) if (e.toLowerCase() === k.toLowerCase()) delete out[e];
+    out[k] = add[k];
+  }
+  return out;
+}
+/* 取密文/tag 的两种拼接顺序：0 = ct||tag，1 = tag||ct */
+function splitCtTag(buf, order) {
+  if (order === 1) return { ct: buf.slice(16), tag: buf.slice(0, 16) };
+  return { ct: buf.slice(0, buf.length - 16), tag: buf.slice(buf.length - 16) };
+}
+function joinCtTag(ct, tag, order) {
+  return order === 1 ? concatBytes(tag, ct) : concatBytes(ct, tag);
 }
 
 /* ============================================================
@@ -720,46 +764,59 @@ function handleRequest() {
     var j = JSON.parse(body);
     if (!j || !j.encryptedKey) { $done(out); return; }
 
-    var env = { data: j.data, iv: j.iv, ivB64: j.iv, nonce: j.nonce, timestamp: j.timestamp, keyId: j.keyId };
+    var env = { data: j.data, iv: j.iv, ivB64: j.iv, nonce: j.nonce, timestamp: j.timestamp, keyId: j.keyId, encryptedKey: j.encryptedKey, saltB64: st.saltB64 };
     var ctBytes = b64Decode(j.data || '');
     var ivBytes = b64Decode(j.iv || '');
 
-    var m, cands, i, k, a, plain, found = null, foundAad = new Uint8Array(0);
+    var m, cands, i, k, a, oi, plain, found = null, foundAad = { tag: 'none', aad: new Uint8Array(0) }, foundOrder = 0, verified = false;
     m = rsaRawDecrypt(b64Decode(j.encryptedKey));
     cands = keyCandidates(m);
 
+    /* 先找一个「结构性填充」候选兜底。
+       关键认识：这段密文既然能被我们的私钥解出合法填充（PKCS#1 / OAEP 的
+       lHash 校验），就说明它一定是用我们的公钥加密的 —— 此时必须改写它，
+       否则服务端解不开 requested 会直接 400。反过来若填充解析失败，说明
+       这包是用真公钥加的（App 还在用旧缓存），原样放行才是安全的。 */
+    var structural = null;
+    for (i = 0; i < cands.length; i++) {
+      if (padScheme(cands[i].tag) === 'raw') continue;
+      if (cands[i].tag.indexOf(':') >= 0) continue;                       // 优先裸密钥，别从拼接里猜
+      if (cands[i].key.length !== 16 && cands[i].key.length !== 32) continue;
+      structural = cands[i]; break;
+    }
+    if (!structural) for (i = 0; i < cands.length; i++) if (padScheme(cands[i].tag) !== 'raw') { structural = cands[i]; break; }
+
+    /* 再用 GCM 认证标签去「证实」密钥/AAD/拼接顺序（标签通过 = 百分百正确） */
+    var aads = aadCandidates(env);
     for (i = 0; i < cands.length && !found; i++) {
-      var aads = aadCandidates(env);
-      for (a = 0; a < aads.length; a++) {
-        if (ctBytes.length < 16) continue;
-        plain = gcmDecrypt(cands[i].key, ivBytes, aads[a].aad, ctBytes.slice(0, ctBytes.length - 16), ctBytes.slice(ctBytes.length - 16));
-        if (plain) { found = cands[i]; foundAad = aads[a]; break; }
+      if (ctBytes.length < 16) break;
+      for (oi = 0; oi < 2 && !found; oi++) {
+        var sp = splitCtTag(ctBytes, oi);
+        for (a = 0; a < aads.length; a++) {
+          plain = gcmDecrypt(cands[i].key, ivBytes, aads[a].aad, sp.ct, sp.tag);
+          if (plain) { found = cands[i]; foundAad = aads[a]; foundOrder = oi; verified = true; break; }
+        }
       }
     }
+    if (!found && structural) { found = structural; plain = null; }        // 未证实的兜底
 
     if (!found) {
-      // 解不出来：原样放行，避免弄坏 App
-      var structural = false;
-      for (i = 0; i < cands.length; i++) if (padScheme(cands[i].tag) !== 'raw') structural = true;
-      st.lastError = structural ? 'cipher-assumption-failed' : 'key-decode-failed(可能仍是旧公钥)';
+      // 填充都解不出来 => 这包不是给我们公钥的，原样放行（服务端可正常处理）
+      st.lastError = 'blob-not-for-our-key';
       st.lastErrorAt = Date.now();
-      if (structural && st.warnedCipher !== 1) {
-        st.warnedCipher = 1;
-        notify('摩途脚本', '⚠️ 加密方式未识别', '请先在 QX 中关闭本脚本的重写规则，否则摩途部分接口会出错。');
-      }
       saveState(st);
       $done(out);
       return;
     }
 
     // --- 校准签名算法（一次性） ---
-    if (!st.signRule && !st.signCalibFailed) {
+    if (!st.signRule && !st.signCalibFailed && verified) {
       var f = env;
       if (plain) f.plain = bytesToStr(plain);
       var rule = calibrateSign(f, b64Decode(j.sign || ''), found.key, st.saltB64);
       if (rule) {
         st.signRule = rule;
-        if (CFG.notifyCalibrate) notify('摩途脚本', '✅ 安全信道已校准', '填充=' + found.tag + ' AAD=' + foundAad.tag + '\n签名=' + rule.algo + '[' + rule.order.join(',') + '] sep="' + rule.sep + '" key=' + rule.keyTag);
+        if (CFG.notifyCalibrate) notify('摩途脚本', '✅ 安全信道已校准', '填充=' + found.tag + ' AAD=' + foundAad.tag + ' 拼接=' + (foundOrder === 0 ? '密文+tag' : 'tag+密文') + '\n签名=' + rule.algo + '[' + rule.order.join(',') + '] sep="' + rule.sep + '" key=' + rule.keyTag);
       } else {
         st.signCalibFailed = Date.now();   // 未识别则不反复试探
         if (CFG.notifyCalibrate) notify('摩途脚本', '会话密钥已获取', '填充=' + found.tag + ' AAD=' + foundAad.tag + '\n但响应签名算法未识别（不影响解密，仅响应签名可能不被校验）');
@@ -774,16 +831,19 @@ function handleRequest() {
     // --- 把会话密钥用「服务端真公钥」重新加密，请求照常发给服务端 ---
     var srv = SRV_KEY[String(j.keyId)] || SRV_KEY['1'];
     var padded = padBytes(padScheme(found.tag), found.key);
-    if (padded) {
-      j.encryptedKey = b64Encode(rsaRawEncryptTo(srv.n, srv.e, padded));
-      // 重新签名（若已校准出算法）
-      if (st.signRule) {
-        var f2 = { data: j.data, iv: j.iv, nonce: j.nonce, timestamp: j.timestamp, keyId: j.keyId };
-        if (plain) f2.plain = bytesToStr(plain);
-        j.sign = b64Encode(applySign(st.signRule, f2, found.key));
-      }
-      out.body = JSON.stringify(j);
+    if (!padded) { $done(out); return; }
+    j.encryptedKey = b64Encode(rsaRawEncryptTo(srv.n, srv.e, padded));
+    // 重新签名（若已校准出算法；签名可能覆盖 encryptedKey，所以必须在替换之后再算）
+    if (st.signRule) {
+      var f2 = { data: j.data, iv: j.iv, nonce: j.nonce, timestamp: j.timestamp, keyId: j.keyId, encryptedKey: j.encryptedKey };
+      if (plain) f2.plain = bytesToStr(plain);
+      j.sign = b64Encode(applySign(st.signRule, f2, found.key));
     }
+    /* 关键：按原 body 的转义风格重建（原 body 把 / 写成 \/），
+       并显式带上 Content-Length —— 长度对不上服务端会直接 400 Bad Request */
+    var newBody = buildRequestBody(body, j);
+    out.body = newBody;
+    out.headers = mergeHeaders($request.headers, { 'Content-Length': String(byteLen(newBody)) });
     $done(out);
   } catch (e) {
     $done({});
@@ -814,11 +874,8 @@ function rememberKey(hex) {
 }
 
 function aadFor(tag, env) {
-  if (tag === 'nonce') return strToBytes(env.nonce || '');
-  if (tag === 'ts') return strToBytes(String(env.timestamp));
-  if (tag === 'keyId') return strToBytes(String(env.keyId));
-  if (tag === 'nonce+ts') return strToBytes((env.nonce || '') + String(env.timestamp));
-  if (tag === 'ivB64') return strToBytes(env.ivB64 || '');
+  var list = aadCandidates(env);
+  for (var i = 0; i < list.length; i++) if (list[i].tag === tag) return list[i].aad;
   return new Uint8Array(0);
 }
 
@@ -842,32 +899,41 @@ function handleResponse() {
     var ctBytes = b64Decode(rj.data);
     if (ctBytes.length < 16) { $done(out); return; }
     var ivBytes = b64Decode(rj.iv);
-    var env = { data: rj.data, ivB64: rj.iv, nonce: rj.nonce, timestamp: rj.timestamp, keyId: st.keyId };
+    var env = { data: rj.data, ivB64: rj.iv, nonce: rj.nonce, timestamp: rj.timestamp, keyId: st.keyId, saltB64: st.saltB64 };
 
-    // 逐个尝试缓存里的会话密钥，GCM 认证标签就是校验器
-    var keys = findKey(st), i, plain = null, used = null;
-    for (i = 0; i < keys.length; i++) {
-      plain = gcmDecrypt(keys[i].key, ivBytes, aadFor(st.aadTag, env), ctBytes.slice(0, ctBytes.length - 16), ctBytes.slice(ctBytes.length - 16));
-      if (plain) { used = keys[i]; break; }
+    // 逐个尝试缓存里的会话密钥 × AAD × 拼接顺序，GCM 认证标签就是校验器
+    var keys = findKey(st), i, a, oi, plain = null, used = null, usedAadTag = 'none', usedOrder = 0;
+    var aads = aadCandidates(env);
+    for (i = 0; i < keys.length && !plain; i++) {
+      for (oi = 0; oi < 2 && !plain; oi++) {
+        var sp = splitCtTag(ctBytes, oi);
+        for (a = 0; a < aads.length; a++) {
+          plain = gcmDecrypt(keys[i].key, ivBytes, aads[a].aad, sp.ct, sp.tag);
+          if (plain) { used = keys[i]; usedAadTag = aads[a].tag; usedOrder = oi; break; }
+        }
+      }
     }
     if (!plain) { $done(out); return; }
     rememberKey(used.hex);
+    st.aadTag = usedAadTag; saveState(st);
 
     var o = JSON.parse(bytesToStr(plain));
     var changed = CFG.enableVip && patchVip(o);
     var newPlain = strToBytes(JSON.stringify(o));
 
-    // 用新的 IV / nonce / 时间戳重新加密
+    // 用新的 IV / nonce / 时间戳重新加密（AAD 与原响应保持同一约定）
     var newIv = randBytes(12);
     var newEnv = {
       ivB64: b64Encode(newIv),
       nonce: b64Url(randBytes(8)),
-      timestamp: Math.floor(Date.now() / 1000)
+      timestamp: Math.floor(Date.now() / 1000),
+      keyId: st.keyId,
+      saltB64: st.saltB64
     };
-    var enc = gcmEncrypt(used.key, newIv, aadFor(st.aadTag, newEnv), newPlain);
+    var enc = gcmEncrypt(used.key, newIv, aadFor(usedAadTag, newEnv), newPlain);
 
     var res = {
-      data: b64Encode(concatBytes(enc.ct, enc.tag)),    // 密文 || 16 字节 GCM tag
+      data: b64Encode(joinCtTag(enc.ct, enc.tag, usedOrder)),
       iv: newEnv.ivB64,
       nonce: newEnv.nonce,
       sign: rj.sign,
@@ -878,7 +944,6 @@ function handleResponse() {
         data: res.data, iv: res.iv, nonce: res.nonce, timestamp: res.timestamp,
         keyId: st.keyId, plain: JSON.stringify(o)
       };
-      // 去掉未在签名规则中出现的字段，避免污染
       res.sign = b64Encode(applySign(st.signRule, f, used.key));
     }
     out.body = JSON.stringify(res);
