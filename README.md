@@ -104,14 +104,23 @@ POST /v1/xxxSec
 
 **Q：装完规则后「我的」页面报 `Request failed: bad request (400)`？**
 
-已修复（2026-09-15）。400 有两种成因，脚本都已处理：
+已修复（2026-09-15）。400 有三种成因，脚本现在都能正确处理：
 
-1. **会话密钥没解出来** → 请求带着「服务端解不开的 encryptedKey」转发，服务端返回
-   `{"code":400,"msg":"RSA decrypt failed, likely key mismatch or OAEP parameters mismatch"}`。
-   v1 漏了最关键的 **AAD = salt**，现在已按实测方案实现。
-2. **请求体字节数对不上** → 摩途原始 body 把 `/` 转义成 `\/`，用 `JSON.stringify`
+1. **会话密钥没解出来** → 请求带着「服务端解不开的 encryptedKey」转发，
+   服务端报 `"RSA decrypt failed, likely key mismatch or OAEP parameters mismatch"`。
+   原因是 v1 漏了最关键的 **AAD = salt**。
+2. **会话密钥「形态」错了** → 服务端能解开 RSA，但拿到的密钥不对，
+   解出乱码参数 → 校验签名失败，报 `{"code":400,"msg":"sign invalid"}`。
+   **这是本项目最隐蔽的坑**：App 塞进 RSA 的明文是一段 **44 字符的 base64 文本**，
+   服务端拿到后会**先 base64 解码**再用作 AES 密钥。
+   如果改写时直接把「解码后的 32 字节裸密钥」重新加密回去，服务端就会解出错误的密钥。
+   现在脚本会把 **App 的原始 RSA 明文原样转回**（`payload`），而不是回填裸密钥。
+3. **请求体字节数对不上** → 摩途原始 body 把 `/` 转义成 `\/`，用 `JSON.stringify`
    重新序列化会短 3~10 字节，服务端读到「长度不符」的 body 也是 400。
    现在会**按字节数精确对齐**并显式带上 `Content-Length`。
+
+> 三种都是真机实测踩出来的：第 2 种的判别方法很直接 ——
+> 用真服务端对拍，RSA 明文用 base64 文本 → **HTTP 200**；用裸 32 字节 → `sign invalid`。
 
 **Q：怎么判断脚本生效了？**
 
