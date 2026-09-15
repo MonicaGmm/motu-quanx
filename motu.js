@@ -34,9 +34,9 @@
  * ---------------------------- QX 配置 ----------------------------
  * [rewrite_local]
  * # 摩途 · 安全信道中间人（顺序不能颠倒）
- * ^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
- * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
- * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
+ * ^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
+ * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
+ * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
  * # 摩途 · 去广告（穿山甲 Pangle / 优量汇 GDT）
  * ^https?:\/\/api-access\.pangolin-sdk-toutiao\.com\/api\/ad\/ url reject-dict
  * ^https?:\/\/api-access\.pangolin-sdk-toutiao\d?\.com\/api\/ad\/ url reject-dict
@@ -59,6 +59,7 @@ var CFG = {
 };
 
 var PREF_KEY = 'motu_sec_state_v1';
+var SCRIPT_VER = 'motu-qx-5';      // 版本水印（会写进 /api/security/public-key 响应，抓包里可核对）
 
 /* 2026-09 实测确认的加密方案（由抓包 + 客户端二进制字符串双重验证）：
      RSA   : RSA/ECB/OAEPWithSHA-256AndMGF1Padding（App 报错文案亦为
@@ -763,9 +764,11 @@ function serveOurPublicKey() {
       if (o.data.salt) st.saltB64 = o.data.salt;
       if (o.data.keyId) st.keyId = o.data.keyId;
       st.pubKeyAt = Date.now();
+      st.ver = SCRIPT_VER;
       saveState(st);
       o.data.publicKey = OUR_PUBLIC_KEY_B64;              // 换成我们的公钥
       o.data.keyId = o.data.keyId || '1';
+      o._v = SCRIPT_VER;                                  // 版本水印：抓包里能看到跑的是哪一版
       out.body = JSON.stringify(o);
     }
   } catch (e) { }
