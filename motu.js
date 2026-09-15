@@ -543,36 +543,39 @@ function padBytes(scheme, bytes) {
   return pkcs1Pad(bytes, 256);            // 兜底按最常见的 PKCS#1 v1.5
 }
 
-/* --- 解出所有可能的「会话密钥」候选（顺序即优先级） --- */
+/* --- 解出所有可能的「会话密钥」候选（顺序即优先级） ---
+   注意：每个候选都同时带 key（真正用于 AES 的密钥字节）和 payload
+   （客户端塞进 RSA 里的原始明文）。改写请求时必须重新加密 payload ——
+   实测服务端要的是原样明文（本项目是 base64 文本），不是解码后的裸密钥。 */
 function keyCandidates(m) {
   var out = [];
-  function push(tag, bytes) {
+  function push(tag, bytes, payload) {
     if (!bytes || !bytes.length) return;
     if (!(bytes.length === 16 || bytes.length === 24 || bytes.length === 32)) return;
     for (var i = 0; i < out.length; i++) if (out[i].tag === tag) return;
-    out.push({ tag: tag, key: bytes });
+    out.push({ tag: tag, key: bytes, payload: payload || bytes });
   }
   // 解填充后的明文不一定是裸密钥：可能是 base64/hex 文本，或 key||iv 拼接
   function expand(tag, p) {
     if (!p || !p.length) return;
-    push(tag, p);
+    push(tag, p, p);
     if (p.length <= 32) return;
-    push(tag + ':head16', p.slice(0, 16));
-    push(tag + ':head24', p.slice(0, 24));
-    push(tag + ':head32', p.slice(0, 32));
-    push(tag + ':tail16', p.slice(p.length - 16));
-    push(tag + ':tail24', p.slice(p.length - 24));
-    push(tag + ':tail32', p.slice(p.length - 32));
+    push(tag + ':head16', p.slice(0, 16), p);
+    push(tag + ':head24', p.slice(0, 24), p);
+    push(tag + ':head32', p.slice(0, 32), p);
+    push(tag + ':tail16', p.slice(p.length - 16), p);
+    push(tag + ':tail24', p.slice(p.length - 24), p);
+    push(tag + ':tail32', p.slice(p.length - 32), p);
     var s = bytesToStr(p);
-    if (/^[0-9a-fA-F]{32,64}$/.test(s)) push(tag + ':hex', hexToBytes(s));
+    if (/^[0-9a-fA-F]{32,64}$/.test(s)) push(tag + ':hex', hexToBytes(s), p);
     if (/^[A-Za-z0-9+/=_-]{16,}$/.test(s)) {
       var d = b64Decode(s);
-      push(tag + ':b64', d);
+      push(tag + ':b64', d, p);
       if (d.length > 32) {
-        push(tag + ':b64:head16', d.slice(0, 16));
-        push(tag + ':b64:head32', d.slice(0, 32));
-        push(tag + ':b64:tail16', d.slice(d.length - 16));
-        push(tag + ':b64:tail32', d.slice(d.length - 32));
+        push(tag + ':b64:head16', d.slice(0, 16), p);
+        push(tag + ':b64:head32', d.slice(0, 32), p);
+        push(tag + ':b64:tail16', d.slice(d.length - 16), p);
+        push(tag + ':b64:tail32', d.slice(d.length - 32), p);
       }
     }
   }
@@ -580,7 +583,7 @@ function keyCandidates(m) {
   p = oaepUnpad(m, 'sha256', 'sha256', ''); if (p) expand('oaep-sha256', p);
   p = oaepUnpad(m, 'sha256', 'sha1', ''); if (p) expand('oaep-sha256-mgf1sha1', p);
   p = oaepUnpad(m, 'sha1', 'sha1', ''); if (p) expand('oaep-sha1', p);
-  // 最后才是「无填充/未知填充」的兜底猜测
+  // 最后才是「无填充/未知填充」的兜底猜测（拿不到 payload，只能猜密钥）
   push('raw:tail16', m.slice(m.length - 16));
   push('raw:tail24', m.slice(m.length - 24));
   push('raw:tail32', m.slice(m.length - 32));
@@ -802,8 +805,8 @@ function handleRequest() {
       if (!kk && (fp.length === 16 || fp.length === 24 || fp.length === 32)) kk = fp;   // 明文就是裸密钥
       if (kk) {
         // 结构性填充成立 ⇒ 这段密文一定是用我们公钥加的 ⇒ 必须改写，否则服务端解不开
-        // tag 用 'oaep-sha256:known'，padScheme() 会取到 'oaep-sha256'
-        structural = { tag: 'oaep-sha256:known', key: kk };
+        // payload 必须是 App 塞进 RSA 的原始明文（这里是 base64 文本），不能换成解码后的裸密钥
+        structural = { tag: 'oaep-sha256:known', key: kk, payload: fp };
         if (ctBytes.length >= 16) {
           plain = gcmDecrypt(kk, ivBytes, saltAad, ctBytes.slice(0, ctBytes.length - 16), ctBytes.slice(ctBytes.length - 16));
           if (plain) { found = structural; foundAad = { tag: 'saltB64', aad: saltAad }; foundOrder = 0; verified = true; }
@@ -869,7 +872,8 @@ function handleRequest() {
 
     // --- 把会话密钥用「服务端真公钥」重新加密，请求照常发给服务端 ---
     var srv = SRV_KEY[String(j.keyId)] || SRV_KEY['1'];
-    var padded = padBytes(padScheme(found.tag), found.key);
+    // ★ 关键：重新加密的是 App 的原始 RSA 明文（payload），不是解码后的密钥
+    var padded = padBytes(padScheme(found.tag), found.payload || found.key);
     if (!padded) { $done(out); return; }
     j.encryptedKey = b64Encode(rsaRawEncryptTo(srv.n, srv.e, padded));
     // 重新签名（若已校准出算法；签名可能覆盖 encryptedKey，所以必须在替换之后再算）
