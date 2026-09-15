@@ -78,12 +78,20 @@ POST /v1/xxxSec
 
 ## 四、安装
 
+0. **⚠️ 远程脚本会被 QX 缓存，升级脚本必须换 URL 才能生效**（只删规则重加没用，
+   因为缓存按 URL 命中）。所以订阅文件也带版本号：
+   **请添加 `motu-v5.snippet`（v5），不要再用旧的 `motu.snippet`。**
+
 1. QX → 右下角圆盘 →「配置文件」→「重写」→ 右上角 `+` → 添加订阅：
    ```
-   https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.snippet
+   https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.snippet
    ```
+   **添加前请先删掉旧的 motu 订阅**，避免两套规则同时生效。
 
-2. **必须把 `motu.motumap.com` 加进 MITM 主机名，并且证书已受信任**：
+2. **验证跑的是 v5**：抓包里 `GET /api/security/public-key` 的响应多了一个字段
+   `"_v":"motu-qx-5"`。看到它就说明新脚本已生效；没有就是还在跑缓存里的旧版。
+
+3. **必须把 `motu.motumap.com` 加进 MITM 主机名，并且证书已受信任**：
 
    ① 打开 MITM 开关：QX → 圆盘 →「配置文件」→「MITM」
    ② 添加主机名：同页点「主机名」→ `+` → `motu.motumap.com`
@@ -95,8 +103,6 @@ POST /v1/xxxSec
       → iOS 设置 → 通用 → 关于本机 → 拉到底「证书信任设置」→ **打开 Quantumult X 开关**
       （最后这步不做，MITM 会静默失效）
    ④ QX 里重新加载一次配置
-
-3. **远程脚本会被 QX 缓存**：更新后请把该订阅删掉重新添加（或点更新），否则跑的还是旧版本。
 
 4. **完全退出摩途再打开**（App 启动时才会重新拉取公钥）→ 进「我的」页面。
 
@@ -143,8 +149,9 @@ POST /v1/xxxSec
 
 | 文件 | 用途 |
 |---|---|
-| `motu.js` | 脚本本体（公钥替换 / 请求改写 / 响应改写 三合一，纯 JS 实现 AES-GCM、RSA、SHA-256） |
-| `motu.snippet` | QX 重写订阅文件（会员解锁 + 去广告规则） |
+| `motu-v5.js` | **当前版本脚本**（v5）。公钥替换 / 请求改写 / 响应改写 三合一，纯 JS 实现 AES-GCM、RSA、SHA-256 |
+| `motu-v5.snippet` | **当前版本 QX 重写订阅**（会员解锁 + 去广告），指向 `motu-v5.js` |
+| `motu.js` / `motu.snippet` | 与 v5 同内容，保留旧文件名兼容 |
 
 ## 七、免责声明
 
