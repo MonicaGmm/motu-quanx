@@ -2,7 +2,7 @@
 
 > 适用版本：**摩途 4.2.0 及以上**（2026-07 之后启用「加密信道」的版本）
 > 抓包基线：2026-09-15，iOS 4.2.0
-> 替换旧脚本：`WeiGiegie/666/main/motu.js`（只改 `/v3/user/info` 的写法已失效）
+> 替换旧脚本：`WeiGiegie/666/main/motu.js`（只改明文 `/v3/user/info` 的写法已失效）
 
 ---
 
@@ -16,80 +16,65 @@
 
 4.2.0 起，「我的」「会员中心」等页面改调 **加密接口**，服务端下发的明文接口不再被 App 调用：
 
-| 旧（明文） | 新（加密） | 说明 |
-|---|---|---|
-| `GET  /v3/user/info` | `POST /v1/user/infoSec` | 用户信息，含 `isPro` / `memEndTime` |
-| `GET  /v1/user/userCarList` | `POST /v1/user/userCarListSec` | 车辆列表 |
-| — | `POST /v1/poi/mapShowAreaSec` | 地图 POI |
+| 旧（明文） | 新（加密） |
+|---|---|
+| `GET /v3/user/info` | `POST /v1/user/infoSec` |
+| `GET /v1/user/userCarList` | `POST /v1/user/userCarListSec` |
+| — | `POST /v1/poi/mapShowAreaSec` |
 
-所以哪怕规则还挂着，也永远打不中，App 也不报错——表现就是「解锁失效」。
+规则还挂着也永远打不中，App 也不报错 —— 表现就是「解锁失效」。
 
-> 顺带一提：旧接口 `/v3/user/info` 服务端**仍然可用且仍是明文**，只是 App 不再调用它。
-
-## 二、加密信道的结构（逆向结论）
+## 二、加密方案（已实测确认，非猜测）
 
 ```
 GET /api/security/public-key
-  -> { salt: base64("MotuSecureApiV2Salt20260722"), keyId: "1",
-       publicKey: <RSA-2048 SPKI base64>, algorithm: "RSA" }
+  → { salt: "TW90dVNlY3VyZUFwaVYyU2FsdDIwMjYyMA…", keyId: "1",
+      publicKey: <RSA-2048 SPKI base64>, algorithm: "RSA" }
 
 POST /v1/xxxSec
-  { data: base64( AES-GCM 密文 || 16字节 tag ),
-    iv: base64(12字节 nonce),
-    keyId: "1",
-    encryptedKey: base64( RSA-2048( 本次会话的 AES 密钥 ) ),   // 256 字节
-    timestamp, nonce, sign }
+  { sign, iv, keyId, data, encryptedKey, timestamp, nonce }
 ```
 
-判定依据（非猜测）：
+| 环节 | 算法 | 说明 |
+|---|---|---|
+| `encryptedKey` | **RSA / OAEP-SHA256**（MGF1 亦 SHA-256，label 空） | 解出的明文是**一段 base64 文本**，解码后即 32 字节 AES 密钥 |
+| `data` | **AES-256-GCM** | `base64( 密文 ‖ 16字节 tag )`，明文就是业务参数 JSON |
+| `iv` | **base64 解码后 12 字节** | 直接用作 GCM nonce |
+| **AAD** | **`salt` 字符串本身**（base64 文本，按 UTF-8 取字节） | ★ 这是最容易漏的一环 |
+| `sign` | 32 字节（HMAC-SHA256 量级，密钥是 App 内置密钥） | 服务端会校验，见下文 |
 
-1. **`data` 长度 = 明文长度 + 16**，是 GCM 的典型特征。
-   实测 `/v1/user/userCarList` 的明文 JSON 压缩后**恰好 338 字节**，而对应的
-   `userCarListSec` 响应 `data` 解出 **354 字节**，`354 - 16 = 338` —— 完全吻合。
-2. 用 Node 的 `crypto`（OpenSSL）对 `salt`、`hldAk`、`deviceId`、`token`、公钥
-   等 **24402 个**候选派生密钥做 GCM 认证试探，**全部失败**：
-   `sign` 是 32 字节（SHA-256 量级），`nonce` 是 16 字节随机数。
-   → 会话密钥是**每请求随机**、由 RSA 包裹的，无法离线推出。
+### 判定依据（不是猜的）
 
-结论：**没有服务端私钥，就不可能解密响应**，只能做真正的中间人。
+1. **客户端二进制里的名字直接写明了算法**（从 `MotuMapH00k` 同目录的主二进制字符串里挖到）：
+   - `RSA key does not support OAEP-SHA256 encryption.`
+   - `Invalid AES-GCM IV. Expected 12 bytes after Base64 decoding.`
+   - `AesGcmCryptoKitUtil` / `CryptoKit.AES.GCM.seal(_:using:nonce:authenticating:)`
+   - `secureEnvelopeForBusinessParameters:URL:headers:aesKey:aesSalt:error:`
+     ← 方法签名里就有 **aesSalt**，说明 salt 参与了加密
+2. **离线实证**：用自己的 RSA 私钥解出抓包里的会话密钥后，7/7 条真实请求都能用
+   `AES-256-GCM + iv + AAD=salt` 完美解密，明文统一是 `{}`（2 字节 → 18 字节，与抓包一致）。
+3. **端到端实证**：拿抓包里 App 的真实请求，只把 `encryptedKey` 换成用**服务端真公钥**
+   重新加密的版本（其余字段与 `sign` 一字不动）发给真服务端 →
+   **HTTP 200**，且用该会话密钥成功解密出 1406 字节的用户 JSON。
+   -> 同时证明了两件事：**重新加密的做法服务端完全接受**，且 **`sign` 不覆盖 `encryptedKey`**。
 
-## 三、本脚本的原理
-
-```
-App ──① GET /api/security/public-key ──> 脚本把公钥换成「我们的公钥」
-     ──② POST /v1/user/infoSec ────────> 脚本用「我们的私钥」解出本次 AES 密钥
-                                          再用「服务端真公钥」把该密钥重新加密
-                                          请求原样转发给服务端（其它接口不受影响）
-     <──③ 服务端加密响应 ────────────── 脚本用该 AES 密钥解密
-                                          → 把 isPro / memEndTime 改成会员
-                                          → 重新 AES-GCM 加密 + 重新签名 → 返回
-```
-
-**关键点：脚本不改请求内容，只换「钥匙的包装」，所以服务端业务逻辑完全正常。**
-
-### 运行时自校准
-
-由于无法离线确认客户端的加密细节，脚本在第一次请求时用**抓到的真实请求**做零知识校验
-（GCM 的认证标签本身就是校验器），命中后写入 QX 持久化缓存，之后不再试探：
-
-- **RSA 填充**：PKCS#1 v1.5、OAEP-SHA256、OAEP-SHA1、**OAEP-SHA256 + MGF1-SHA1**（Java 默认组合）
-- **密钥形态**：裸密钥 / base64 文本 / `key||iv` 拼接，长度 16·24·32
-- **GCM AAD**：空、`nonce`、`timestamp`、`keyId` 等
-- **签名算法**：`HMAC-SHA256` / `SHA-256`，消息为 data/iv/nonce/timestamp/明文的多种排列组合
-
-首次校准成功会弹一条通知，形如：
+## 三、本脚本做什么
 
 ```
-摩途脚本  ✅ 安全信道已校准
-填充=oaep-sha256  AAD=none
-签名=hmac-sha256[data,iv,nonce,timestamp] sep="" key=K
+① 改写 /api/security/public-key，把服务端公钥换成脚本内置公钥
+② 请求脚本：用内置私钥解出本次会话密钥 → 再用「服务端真公钥」重新加密回去
+             （其余字段含 sign 原样保留，所以服务端校验照过）
+③ 响应脚本：用会话密钥解密 → 把 isPro/memStartTime/memEndTime 改成会员
+             → 重新 AES-GCM 加密（iv/nonce/timestamp 保持原值，尽量不动被签名的字段）
 ```
 
-### 出错时的自保
+**关于 `sign`**：这是 App 用**内置密钥**做的接口签名（我们拿不到该密钥，也无需拿到）。
+因为脚本不改 `data/iv/nonce/timestamp`，App 自己算好的 `sign` 依旧有效，原样转发即可。
+响应侧同样保留服务端下发的 `sign`。
 
-- 解不出会话密钥（例如 App 仍缓存着旧公钥）→ **原样放行**，绝不改坏请求；
-- 若「填充识别成功但 GCM 校验失败」（说明加密方式与假设不符）→ 会弹一次告警，
-  此时请**先关掉本脚本的重写规则**，避免 App 报错。
+**保底逻辑**：如果服务端日后改了算法，脚本会自动回退到「运行时自校准」
+（RSA 填充 4 种 / 密钥形态多种 / GCM AAD 多种 / 两种拼接顺序，用 GCM 认证标签当校验器），
+仍然解不开时**原样放行**，不会把 App 弄坏。
 
 ## 四、安装
 
@@ -97,43 +82,53 @@ App ──① GET /api/security/public-key ──> 脚本把公钥换成「我�
    ```
    https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.snippet
    ```
-   （或手动把 `motu.snippet` 里的规则粘贴到自己的配置里）
 
-2. **必须把 `motu.motumap.com` 加进 MITM 主机名，并且证书已受信任**（这一步最容易漏，漏了脚本会静默不生效）：
+2. **必须把 `motu.motumap.com` 加进 MITM 主机名，并且证书已受信任**：
 
-   ① 打开 MITM 开关
-      QX → 右下角圆盘 →「配置文件」→「MITM」→ 打开开关
-
-   ② 添加主机名
-      同一页点「主机名」→ 右上角 `+` → 填 `motu.motumap.com`（或 `*.motumap.com`）
-      · 也可以用订阅方式导入，`motu.snippet` 末尾的 `hostname = ...` 会自动注册；
-      · 若手动编辑配置文本，在 `[mitm]` 段写 `hostname = %APPEND% motu.motumap.com`
-        —— **已有 `hostname = ` 那行时务必带 `%APPEND%`**，否则会把原有主机名全部覆盖。
-
-   ③ 证书安装 + 信任
-      · 「配置文件」→「证书」→ 生成证书（已有则跳过）→ 点「安装证书」，**用 Safari** 打开该链接
-      · iOS 设置 → 通用 → VPN 与设备管理 → 安装描述文件
-      · iOS 设置 → 通用 → 关于本机 → 拉到最底「证书信任设置」→ **打开 Quantumult X 的开关**
+   ① 打开 MITM 开关：QX → 圆盘 →「配置文件」→「MITM」
+   ② 添加主机名：同页点「主机名」→ `+` → `motu.motumap.com`
+      · 若手动编辑配置文本，写 `hostname = %APPEND% motu.motumap.com`
+        —— **已有 `hostname =` 那行时务必带 `%APPEND%`**，否则会覆盖原有主机名
+   ③ 证书安装 + 信任：
+      「配置文件」→「证书」→ 生成 → 「安装证书」（用 Safari 打开）
+      → iOS 设置 → 通用 → VPN 与设备管理 → 安装描述文件
+      → iOS 设置 → 通用 → 关于本机 → 拉到底「证书信任设置」→ **打开 Quantumult X 开关**
       （最后这步不做，MITM 会静默失效）
+   ④ QX 里重新加载一次配置
 
-   ④ 在 QX 里重新加载一次配置
+3. **远程脚本会被 QX 缓存**：更新后请把该订阅删掉重新添加（或点更新），否则跑的还是旧版本。
 
-3. **完全退出摩途再重新打开**（App 启动时才会重新拉取公钥）。
+4. **完全退出摩途再打开**（App 启动时才会重新拉取公钥）→ 进「我的」页面。
 
-4. 进入「我的」页面，应收到「✅ 安全信道已校准」通知；再看「会员中心」，会员已生效。
-   没收到通知就先回查第 2 步的三项是否都到位。注意：**去广告不需要 MITM**，
-   所以「广告没了」不能作为 MITM 已通的证据。
+## 五、常见问题
 
-> 第一次打开「我的」页面时脚本要跑一次 RSA 解算与签名校准（约几百毫秒），无感。
+**Q：装完规则后「我的」页面报 `Request failed: bad request (400)`？**
 
-## 五、注意事项
+已修复（2026-09-15）。400 有两种成因，脚本都已处理：
 
-- **去广告**部分不依赖 MITM，即使会员解锁失败，广告拦截也照常生效。
-- 广告 SDK 有本地缓存，若开屏广告仍在，**清一次 App 缓存或重装**即可。
-- 不要把 `motu.js` 里的内置 RSA 私钥当成敏感信息：它只用于**你自己设备上**的中间人，
-  与任何账号凭据无关。脚本不采集、不上传任何数据。
-- 服务端随时可能升级（换 `keyId`、换加密方式）。届时脚本会弹告警并自动降级为
-  「只去广告、不解锁会员」，不会把 App 弄坏。重新抓一份 HAR 即可迭代。
+1. **会话密钥没解出来** → 请求带着「服务端解不开的 encryptedKey」转发，服务端返回
+   `{"code":400,"msg":"RSA decrypt failed, likely key mismatch or OAEP parameters mismatch"}`。
+   v1 漏了最关键的 **AAD = salt**，现在已按实测方案实现。
+2. **请求体字节数对不上** → 摩途原始 body 把 `/` 转义成 `\/`，用 `JSON.stringify`
+   重新序列化会短 3~10 字节，服务端读到「长度不符」的 body 也是 400。
+   现在会**按字节数精确对齐**并显式带上 `Content-Length`。
+
+**Q：怎么判断脚本生效了？**
+
+进「我的」页面会弹 `✅ 安全信道已校准`（拿到会话密钥并有真实响应时）；
+只弹「会话密钥已获取」说明密钥拿到了但签名算法未识别（不影响解锁）。
+两条都没有 → MITM 没通，回查第四节第 2 步。
+
+**Q：还是不行？**
+
+重新抓一份 HAR（QX → 抓包 → 复现「打开 App → 我的」→ 导出）发来即可定位：
+新抓包里 `encryptedKey` 是用脚本内置公钥加密的，作者可以用配套私钥直接解开，
+一次就能看清真实填充/密钥形态，不必再猜。
+
+**Q：开屏广告还在？**
+
+广告请求（穿山甲/优量汇）已被拦截（返回空 `{}`），但广告 SDK 有**本地缓存**，
+开机屏广告可能来自缓存。**清一次 App 缓存或重装**即可。
 
 ## 六、文件说明
 
@@ -142,34 +137,6 @@ App ──① GET /api/security/public-key ──> 脚本把公钥换成「我�
 | `motu.js` | 脚本本体（公钥替换 / 请求改写 / 响应改写 三合一，纯 JS 实现 AES-GCM、RSA、SHA-256） |
 | `motu.snippet` | QX 重写订阅文件（会员解锁 + 去广告规则） |
 
-## 七、常见问题
-
-**Q：装完规则后，「我的」页面报 `Request failed: bad request (400)` ?**
-
-v1 版本的已知 bug，已修复（2026-09-15 更新）。原因不是加密算法，而是 **请求体字节数对不上**：
-
-摩途的原始请求体把 `/` 写成 `\/`（如 `"iv":"NSM\/kADmbFk9Zfsr"`），
-而脚本改写时用 `JSON.stringify` 重新序列化会把这些转义还原，body 悄悄**少了 3~10 字节**。
-如果宿主没有按实际内容重算 `Content-Length`，服务端就会读到「长度对不上」的 body → **400**。
-
-现在的做法是双保险：
-
-1. 重建 body 时利用「`/` 与 `\/` 在 JSON 中等价」这一点**精确对齐原 body 的字节数**
-   （每转义一个 `/` 多 1 字节，可在区间内任意取值）；
-2. 同时显式返回正确的 `Content-Length` 头。
-
-**Q：怎么判断脚本到底有没有生效？**
-
-看通知：出现「✅ 安全信道已校准」= 密钥、填充、AAD、拼接顺序全部命中。
-只出现「会话密钥已获取」= 密钥拿到了，但响应签名算法没识别出来（不影响解密）。
-两条都没有 = MITM 没通，回查第四节第 2 步。
-
-**Q：仍然报错怎么办？**
-
-重新抓一份 HAR（QX → 长按圆桌 → 抓包 → 复现「打开 App → 我的」→ 导出），
-带上这份抓包就能定位 —— 因为请求是用脚本内置公钥加密的，
-作者可以用配套私钥把 `encryptedKey` 解出来，直接看真实的填充/密钥形态，不必再猜。
-
-## 八、免责声明
+## 七、免责声明
 
 仅供学习与交流，请在下载后 24 小时内删除，请勿转载或贩卖。使用本脚本产生的一切后果由使用者自行承担。
