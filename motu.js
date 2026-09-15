@@ -60,6 +60,19 @@ var CFG = {
 
 var PREF_KEY = 'motu_sec_state_v1';
 
+/* 2026-09 实测确认的加密方案（由抓包 + 客户端二进制字符串双重验证）：
+     RSA   : RSA/ECB/OAEPWithSHA-256AndMGF1Padding（App 报错文案亦为
+             "RSA key does not support OAEP-SHA256 encryption."）
+             encryptedKey = RSA( base64 文本 )，该文本解码后即 AES 密钥
+     AES   : AES-256-GCM（CryptoKit AES.GCM.seal(_:using:nonce:authenticating:)）
+             iv   = base64 解码后 12 字节
+             AAD  = /api/security/public-key 返回的 salt 字符串 ★关键
+             data = base64( 密文 ‖ 16 字节 tag )
+   明文即业务参数 JSON（infoSec 无参时为 "{}"，2 字节 -> 16+2=18 字节，与抓包一致）
+   另外服务端会校验 sign（伪造会被 400 "sign invalid"），但我们的改写
+   不动 data/iv/nonce/timestamp，App 自己算好的 sign 依然有效，故原样保留。 */
+var KNOWN_SALT_B64 = 'TW90dVNlY3VyZUFwaVYyU2FsdDIwMjYwNzIy';   // salt 兜底值
+
 /* ============================================================
  * 0. 内置密钥
  * ============================================================ */
@@ -663,16 +676,18 @@ function applySign(rule, f, K) {
  * 6. GCM 参数自校准（AAD 约定）
  * ============================================================ */
 function aadCandidates(env) {
-  var out = [{ tag: 'none', aad: new Uint8Array(0) }];
+  var out = [];
+  // salt 是实测确认的 AAD，放最前面
+  if (env.saltB64) out.push({ tag: 'saltB64', aad: strToBytes(env.saltB64) });
+  out.push({ tag: 'knownSalt', aad: strToBytes(KNOWN_SALT_B64) });
+  out.push({ tag: 'none', aad: new Uint8Array(0) });
+  if (env.saltB64) out.push({ tag: 'saltRaw', aad: b64Decode(env.saltB64) });
   if (env.nonce) out.push({ tag: 'nonce', aad: strToBytes(env.nonce) });
   if (env.timestamp !== undefined && env.timestamp !== null) out.push({ tag: 'ts', aad: strToBytes(String(env.timestamp)) });
   if (env.keyId) out.push({ tag: 'keyId', aad: strToBytes(String(env.keyId)) });
   if (env.nonce && env.timestamp !== undefined) out.push({ tag: 'nonce+ts', aad: strToBytes(env.nonce + String(env.timestamp)) });
-  if (env.timestamp !== undefined && env.nonce) out.push({ tag: 'ts+nonce', aad: strToBytes(String(env.timestamp) + env.nonce) });
   if (env.ivB64) out.push({ tag: 'ivB64', aad: strToBytes(env.ivB64) });
   if (env.keyId && env.nonce) out.push({ tag: 'keyId+nonce', aad: strToBytes(String(env.keyId) + env.nonce) });
-  if (env.saltB64) out.push({ tag: 'saltB64', aad: strToBytes(env.saltB64) });
-  if (env.saltB64) out.push({ tag: 'saltRaw', aad: b64Decode(env.saltB64) });
   out.push({ tag: 'motu', aad: strToBytes('motu') });
   return out;
 }
@@ -768,39 +783,62 @@ function handleRequest() {
     var ctBytes = b64Decode(j.data || '');
     var ivBytes = b64Decode(j.iv || '');
 
-    var m, cands, i, k, a, oi, plain, found = null, foundAad = { tag: 'none', aad: new Uint8Array(0) }, foundOrder = 0, verified = false;
+    var m, cands, i, k, a, oi, plain, found = null, foundAad = { tag: 'saltB64', aad: new Uint8Array(0) }, foundOrder = 0, verified = false;
     m = rsaRawDecrypt(b64Decode(j.encryptedKey));
     cands = keyCandidates(m);
 
-    /* 先找一个「结构性填充」候选兜底。
-       关键认识：这段密文既然能被我们的私钥解出合法填充（PKCS#1 / OAEP 的
-       lHash 校验），就说明它一定是用我们的公钥加密的 —— 此时必须改写它，
-       否则服务端解不开 requested 会直接 400。反过来若填充解析失败，说明
-       这包是用真公钥加的（App 还在用旧缓存），原样放行才是安全的。 */
     var structural = null;
-    for (i = 0; i < cands.length; i++) {
-      if (padScheme(cands[i].tag) === 'raw') continue;
-      if (cands[i].tag.indexOf(':') >= 0) continue;                       // 优先裸密钥，别从拼接里猜
-      if (cands[i].key.length !== 16 && cands[i].key.length !== 32) continue;
-      structural = cands[i]; break;
-    }
-    if (!structural) for (i = 0; i < cands.length; i++) if (padScheme(cands[i].tag) !== 'raw') { structural = cands[i]; break; }
 
-    /* 再用 GCM 认证标签去「证实」密钥/AAD/拼接顺序（标签通过 = 百分百正确） */
-    var aads = aadCandidates(env);
-    for (i = 0; i < cands.length && !found; i++) {
-      if (ctBytes.length < 16) break;
-      for (oi = 0; oi < 2 && !found; oi++) {
-        var sp = splitCtTag(ctBytes, oi);
-        for (a = 0; a < aads.length; a++) {
-          plain = gcmDecrypt(cands[i].key, ivBytes, aads[a].aad, sp.ct, sp.tag);
-          if (plain) { found = cands[i]; foundAad = aads[a]; foundOrder = oi; verified = true; break; }
+    /* ---------- 已知方案直通：OAEP-SHA256 → base64 文本 → AES-256 ---------- */
+    var saltAad = strToBytes(st.saltB64 || KNOWN_SALT_B64);
+    var fp = oaepUnpad(m, 'sha256', 'sha256', '');
+    if (fp && fp.length) {
+      var kk = null;
+      var txt = bytesToStr(fp);
+      if (/^[A-Za-z0-9+/=]{16,}$/.test(txt)) {                  // 明文是一段 base64 文本（实测如此）
+        var dec = b64Decode(txt);
+        if (dec.length === 16 || dec.length === 24 || dec.length === 32) kk = dec;
+      }
+      if (!kk && (fp.length === 16 || fp.length === 24 || fp.length === 32)) kk = fp;   // 明文就是裸密钥
+      if (kk) {
+        // 结构性填充成立 ⇒ 这段密文一定是用我们公钥加的 ⇒ 必须改写，否则服务端解不开
+        // tag 用 'oaep-sha256:known'，padScheme() 会取到 'oaep-sha256'
+        structural = { tag: 'oaep-sha256:known', key: kk };
+        if (ctBytes.length >= 16) {
+          plain = gcmDecrypt(kk, ivBytes, saltAad, ctBytes.slice(0, ctBytes.length - 16), ctBytes.slice(ctBytes.length - 16));
+          if (plain) { found = structural; foundAad = { tag: 'saltB64', aad: saltAad }; foundOrder = 0; verified = true; }
         }
       }
     }
-    if (!found && structural) { found = structural; plain = null; }        // 未证实的兜底
 
+    /* 依次找其它结构性填充候选作为兜底（在没有直通结果时） */
+    if (!structural) {
+      for (i = 0; i < cands.length; i++) {
+        if (padScheme(cands[i].tag) === 'raw') continue;
+        if (cands[i].tag.indexOf(':') >= 0) continue;
+        if (cands[i].key.length !== 16 && cands[i].key.length !== 32) continue;
+        structural = cands[i]; break;
+      }
+      if (!structural) for (i = 0; i < cands.length; i++) if (padScheme(cands[i].tag) !== 'raw') { structural = cands[i]; break; }
+    }
+
+    /* 若直通未通过，再用 GCM 认证标签穷举「密钥 × AAD × 拼接顺序」 */
     if (!found) {
+      var aads = aadCandidates(env);
+      for (i = 0; i < cands.length && !found; i++) {
+        if (ctBytes.length < 16) break;
+        for (oi = 0; oi < 2 && !found; oi++) {
+          var sp = splitCtTag(ctBytes, oi);
+          for (a = 0; a < aads.length; a++) {
+            plain = gcmDecrypt(cands[i].key, ivBytes, aads[a].aad, sp.ct, sp.tag);
+            if (plain) { found = cands[i]; foundAad = aads[a]; foundOrder = oi; verified = true; break; }
+          }
+        }
+      }
+    }
+    if (!found && structural) plain = null;        // 未证实，但仍按结构性候选改写
+
+    if (!found && !structural) {
       // 填充都解不出来 => 这包不是给我们公钥的，原样放行（服务端可正常处理）
       st.lastError = 'blob-not-for-our-key';
       st.lastErrorAt = Date.now();
@@ -808,6 +846,7 @@ function handleRequest() {
       $done(out);
       return;
     }
+    if (!found) found = structural;
 
     // --- 校准签名算法（一次性） ---
     if (!st.signRule && !st.signCalibFailed && verified) {
@@ -921,23 +960,17 @@ function handleResponse() {
     var changed = CFG.enableVip && patchVip(o);
     var newPlain = strToBytes(JSON.stringify(o));
 
-    // 用新的 IV / nonce / 时间戳重新加密（AAD 与原响应保持同一约定）
-    var newIv = randBytes(12);
-    var newEnv = {
-      ivB64: b64Encode(newIv),
-      nonce: b64Url(randBytes(8)),
-      timestamp: Math.floor(Date.now() / 1000),
-      keyId: st.keyId,
-      saltB64: st.saltB64
-    };
-    var enc = gcmEncrypt(used.key, newIv, aadFor(usedAadTag, newEnv), newPlain);
+    // 重新加密：只换 data，iv / nonce / timestamp 原样保留 ——
+    // 尽量不动可能被 sign 覆盖的字段，App 端校验最容易通过
+    var newEnv = { ivB64: rj.iv, nonce: rj.nonce, timestamp: rj.timestamp, keyId: st.keyId, saltB64: st.saltB64 };
+    var enc = gcmEncrypt(used.key, ivBytes, aadFor(usedAadTag, newEnv), newPlain);
 
     var res = {
       data: b64Encode(joinCtTag(enc.ct, enc.tag, usedOrder)),
-      iv: newEnv.ivB64,
-      nonce: newEnv.nonce,
+      iv: rj.iv,
+      nonce: rj.nonce,
       sign: rj.sign,
-      timestamp: newEnv.timestamp
+      timestamp: rj.timestamp
     };
     if (st.signRule) {
       var f = {
