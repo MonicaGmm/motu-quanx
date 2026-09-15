@@ -34,9 +34,9 @@
  * ---------------------------- QX 配置 ----------------------------
  * [rewrite_local]
  * # 摩途 · 安全信道中间人（顺序不能颠倒）
- * ^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
- * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
- * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
+ * ^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v6.js
+ * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v6.js
+ * ^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v6.js
  * # 摩途 · 去广告（穿山甲 Pangle / 优量汇 GDT）
  * ^https?:\/\/api-access\.pangolin-sdk-toutiao\.com\/api\/ad\/ url reject-dict
  * ^https?:\/\/api-access\.pangolin-sdk-toutiao\d?\.com\/api\/ad\/ url reject-dict
@@ -50,8 +50,16 @@
 'use strict';
 
 var CFG = {
-  // 解锁会员
-  enableVip: true,
+  /* ⚠️ 2026-09-15 实测结论：响应侧改不了
+     服务端所有 Sec 接口已经全部调通（HTTP 200、响应可正常解密），
+     但 App 会校验响应里的 sign —— 该签名用的是 **App 内置密钥**
+     （SDK 的 updateSecurityConfigWithAppId / HmacUtil，密钥不可从流量推导，
+      已尝试 4 万余种组合均未命中）。一旦脚本改动响应内容，App 就报
+      「网络数据安全校验未通过，请检查网络环境或重新登录」。
+     所以默认关闭响应改写：只保留「请求侧透明转发」，让 App 功能完全正常
+     （我的页、首页电子眼等一律可用），广告由重写规则拦截。
+     想把会员字段改上去做实验的话，把下面改成 true（会触发上述安全提示）。 */
+  enableVip: false,
   // 是否在首次自动校准时发通知（调试用，可关）
   notifyCalibrate: true,
   // 会员到期时间：4102415999 = 2099-12-31
@@ -59,7 +67,7 @@ var CFG = {
 };
 
 var PREF_KEY = 'motu_sec_state_v1';
-var SCRIPT_VER = 'motu-qx-5';      // 版本水印（会写进 /api/security/public-key 响应，抓包里可核对）
+var SCRIPT_VER = 'motu-qx-6';      // 版本水印（会写进 /api/security/public-key 响应，抓包里可核对）
 
 /* 2026-09 实测确认的加密方案（由抓包 + 客户端二进制字符串双重验证）：
      RSA   : RSA/ECB/OAEPWithSHA-256AndMGF1Padding（App 报错文案亦为
@@ -939,6 +947,9 @@ function patchVip(o) {
 function handleResponse() {
   var st = loadState();
   var out = { body: $response.body };
+  // 响应侧改不了（App 会校验内置密钥签名的 sign），默认原样放行，
+  // 只让请求侧把「会话密钥的包装」换回去，App 依旧能正常解密服务端响应。
+  if (!CFG.enableVip) { $done(out); return; }
   try {
     var rj = JSON.parse($response.body);
     if (!rj || !rj.data || !rj.iv) { $done(out); return; }
