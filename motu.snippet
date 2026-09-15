@@ -1,12 +1,13 @@
 # 摩途 motumap · 会员解锁 + 去广告    (Quantumult X 重写订阅)
+# 版本：v5  —— 脚本文件名带版本号，避免 QX 命中旧缓存
 # 适用：摩途 4.2.0+（2026-07 之后启用加密通道的版本）
 # 脚本：https://github.com/MonicaGmm/motu-quanx
 
 # ============ 一、会员解锁：安全信道中间人 ============
 # 顺序不能颠倒：先换公钥，再拦请求拿会话密钥，最后改响应
-^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
-^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
-^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu.js
+^https:\/\/motu\.motumap\.com\/api\/security\/public-key url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
+^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-request-body  https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
+^https:\/\/motu\.motumap\.com\/v\d+\/.*Sec url script-response-body https://raw.githubusercontent.com/MonicaGmm/motu-quanx/main/motu-v5.js
 
 # ============ 二、去广告（穿山甲 Pangle / 优量汇 GDT）============
 # 开屏广告、Banner 等均来自这两个广告联盟，拦截后不再下发
