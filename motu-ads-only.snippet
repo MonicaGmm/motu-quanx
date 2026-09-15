@@ -1,0 +1,12 @@
+# 摩途 motumap · 仅去广告（保底版，不碰加密信道）
+# 版本：ads-only  —— 完全不改任何摩途业务请求/响应，App 100% 原样工作
+# 适用：装了 motu-v6 后 App 仍报「网络数据安全校验未通过」时使用
+# 仓库：https://github.com/MonicaGmm/motu-quanx
+
+# ============ 去广告（穿山甲 Pangle / 优量汇 GDT）============
+# 开屏广告、Banner 等均来自这两个广告联盟，拦截后不再下发
+^https?:\/\/api-access\.pangolin-sdk-toutiao\d?\.com\/api\/ad\/ url reject-dict
+^https?:\/\/ether-pack\.pangolin-sdk-toutiao\.com\/ url reject-dict
+^https?:\/\/mi\.gdt\.qq\.com url reject-dict
+
+hostname = motu.motumap.com
